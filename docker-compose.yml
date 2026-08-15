@@ -1,0 +1,31 @@
+services:
+  pugotilist:
+    build: .
+    container_name: pugotilist
+    ports:
+      - "3021:3020"
+    environment:
+      PORT: "3020"
+      DB_FILE: "/app/data/pugotilist.db"
+      PUGOTILAB_PROFILE_URL: "http://pugotilab-auth:8080/auth/api/profile"
+      PUGOTILAB_LOGIN_URL: "https://pugotilab.com/auth"
+      PUBLIC_ORIGIN: "https://list.pugotilab.com"
+      TMDB_READ_TOKEN: "${TMDB_READ_TOKEN:-}"
+      IGDB_CLIENT_ID: "${IGDB_CLIENT_ID:-}"
+      IGDB_CLIENT_SECRET: "${IGDB_CLIENT_SECRET:-}"
+      STEAM_WEB_API_KEY: "${STEAM_WEB_API_KEY:-}"
+      PUGOTITASKS_API_TOKEN: "${PUGOTITASKS_API_TOKEN:-}"
+      JELLYFIN_DB_FILE: "/jellyfin/jellyfin.db"
+      JELLYFIN_SERVER_ID: "230f9c38281e4a15ae124ac21e70dbd9"
+      TZ: "America/Maceio"
+    volumes:
+      - /DATA/AppData/pugotilist/data:/app/data
+      - /DATA/AppData/jellyfin/config/data/data:/jellyfin:ro
+    networks:
+      - default
+      - pugotilab
+    restart: unless-stopped
+
+networks:
+  pugotilab:
+    external: true
