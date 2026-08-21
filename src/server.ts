@@ -13,6 +13,10 @@ const jellyfinDbFile = process.env.JELLYFIN_DB_FILE || "";
 const jellyfinServerId = process.env.JELLYFIN_SERVER_ID || "230f9c38281e4a15ae124ac21e70dbd9";
 const publicOrigin = process.env.PUBLIC_ORIGIN || "https://list.pugotilab.com";
 const steamApiKey = process.env.STEAM_WEB_API_KEY || "";
+const xboxClientId = process.env.XBOX_CLIENT_ID || "";
+const xboxClientSecret = process.env.XBOX_CLIENT_SECRET || "";
+const xboxRedirectUri = process.env.XBOX_REDIRECT_URI || `${publicOrigin}/api/integrations/xbox/callback`;
+const xboxTokenEncryptionKey = process.env.XBOX_TOKEN_ENCRYPTION_KEY || "";
 const steamGuideCache = new Map<string,{expiresAt:number,data:any}>();
 const tasksApiUrl = process.env.PUGOTITASKS_API_URL || "http://pugotitasks:3010/api/integrations/v1";
 const tasksTokenFile = path.join(path.dirname(dbFile), "pugotitasks-token");
@@ -92,15 +96,33 @@ db.exec(`
     user_id TEXT NOT NULL,
     expires_at INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS user_xbox_connections (
+    user_id TEXT PRIMARY KEY,
+    xuid TEXT NOT NULL UNIQUE,
+    gamertag TEXT NOT NULL DEFAULT '',
+    refresh_token TEXT NOT NULL,
+    connected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_synced_at TEXT
+  );
+  CREATE TABLE IF NOT EXISTS xbox_oauth_states (
+    state TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    return_base TEXT NOT NULL DEFAULT ''
+  );
 `);
 const libraryColumns = db.prepare("PRAGMA table_info(library_items)").all() as { name:string }[];
 if (!libraryColumns.some(column=>column.name==="play_platform")) db.exec("ALTER TABLE library_items ADD COLUMN play_platform TEXT NOT NULL DEFAULT ''");
 if (!libraryColumns.some(column=>column.name==="creator_name")) db.exec("ALTER TABLE library_items ADD COLUMN creator_name TEXT NOT NULL DEFAULT ''");
 if (!libraryColumns.some(column=>column.name==="content_category")) db.exec("ALTER TABLE library_items ADD COLUMN content_category TEXT NOT NULL DEFAULT ''");
 if (!libraryColumns.some(column=>column.name==="steam_app_id")) db.exec("ALTER TABLE library_items ADD COLUMN steam_app_id TEXT NOT NULL DEFAULT ''");
+if (!libraryColumns.some(column=>column.name==="xbox_title_id")) db.exec("ALTER TABLE library_items ADD COLUMN xbox_title_id TEXT NOT NULL DEFAULT ''");
 if (!libraryColumns.some(column=>column.name==="achievement_total")) db.exec("ALTER TABLE library_items ADD COLUMN achievement_total INTEGER NOT NULL DEFAULT 0");
 if (!libraryColumns.some(column=>column.name==="achievement_unlocked")) db.exec("ALTER TABLE library_items ADD COLUMN achievement_unlocked INTEGER NOT NULL DEFAULT 0");
 if (!libraryColumns.some(column=>column.name==="achievements_synced_at")) db.exec("ALTER TABLE library_items ADD COLUMN achievements_synced_at TEXT NOT NULL DEFAULT ''");
+if (!libraryColumns.some(column=>column.name==="xbox_achievement_total")) db.exec("ALTER TABLE library_items ADD COLUMN xbox_achievement_total INTEGER NOT NULL DEFAULT 0");
+if (!libraryColumns.some(column=>column.name==="xbox_achievement_unlocked")) db.exec("ALTER TABLE library_items ADD COLUMN xbox_achievement_unlocked INTEGER NOT NULL DEFAULT 0");
+if (!libraryColumns.some(column=>column.name==="xbox_achievements_synced_at")) db.exec("ALTER TABLE library_items ADD COLUMN xbox_achievements_synced_at TEXT NOT NULL DEFAULT ''");
 if (!libraryColumns.some(column=>column.name==="work_situation")) db.exec("ALTER TABLE library_items ADD COLUMN work_situation TEXT NOT NULL DEFAULT ''");
 const steamStateColumns=db.prepare("PRAGMA table_info(steam_openid_states)").all() as {name:string}[];
 if(!steamStateColumns.some(column=>column.name==="return_base"))db.exec("ALTER TABLE steam_openid_states ADD COLUMN return_base TEXT NOT NULL DEFAULT ''");
@@ -117,6 +139,22 @@ async function tasksApi(pathname:string,options:RequestInit={}){
   const body=await response.json().catch(()=>({}));
   if(!response.ok)throw new Error(body.error||"PugotiTasks indisponível.");
   return body as any;
+}
+function xboxCipherKey(){if(!xboxTokenEncryptionKey)throw new Error("Integração Xbox sem chave de proteção configurada.");return crypto.createHash("sha256").update(xboxTokenEncryptionKey).digest()}
+function encryptXboxToken(value:string){const iv=crypto.randomBytes(12),cipher=crypto.createCipheriv("aes-256-gcm",xboxCipherKey(),iv);const encrypted=Buffer.concat([cipher.update(value,"utf8"),cipher.final()]);return `${iv.toString("base64url")}.${cipher.getAuthTag().toString("base64url")}.${encrypted.toString("base64url")}`}
+function decryptXboxToken(value:string){const [iv,tag,data]=value.split(".");if(!iv||!tag||!data)throw new Error("Token Xbox inválido.");const decipher=crypto.createDecipheriv("aes-256-gcm",xboxCipherKey(),Buffer.from(iv,"base64url"));decipher.setAuthTag(Buffer.from(tag,"base64url"));return Buffer.concat([decipher.update(Buffer.from(data,"base64url")),decipher.final()]).toString("utf8")}
+async function xboxMicrosoftToken(params:URLSearchParams){const response=await fetch("https://login.microsoftonline.com/consumers/oauth2/v2.0/token",{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:params,signal:AbortSignal.timeout(15000)});const body=await response.json().catch(()=>({}));if(!response.ok||!body.access_token)throw new Error("A Microsoft não autorizou a conexão Xbox.");return body as {access_token:string;refresh_token?:string}}
+async function xboxUserToken(accessToken:string){const response=await fetch("https://user.auth.xboxlive.com/user/authenticate",{method:"POST",headers:{"content-type":"application/json","x-xbl-contract-version":"1"},body:JSON.stringify({RelyingParty:"http://auth.xboxlive.com",TokenType:"JWT",Properties:{AuthMethod:"RPS",SiteName:"user.auth.xboxlive.com",RpsTicket:`d=${accessToken}`}}),signal:AbortSignal.timeout(15000)});const body=await response.json().catch(()=>({}));if(!response.ok||!body.Token||!body.DisplayClaims?.xui?.[0]?.uhs)throw new Error("A conta Microsoft não possui uma identidade Xbox utilizável.");return body as {Token:string;DisplayClaims:{xui:Array<{uhs:string;xid?:string}>}}
+}
+async function xboxSessionFromAccessToken(accessToken:string){const user=await xboxUserToken(accessToken);const response=await fetch("https://xsts.auth.xboxlive.com/xsts/authorize",{method:"POST",headers:{"content-type":"application/json","x-xbl-contract-version":"1"},body:JSON.stringify({Properties:{SandboxId:"RETAIL",UserTokens:[user.Token]},RelyingParty:"http://xboxlive.com",TokenType:"JWT"}),signal:AbortSignal.timeout(15000)});const body=await response.json().catch(()=>({}));if(!response.ok||!body.Token||!body.DisplayClaims?.xui?.[0]?.xid||!body.DisplayClaims?.xui?.[0]?.uhs)throw new Error("O Xbox não autorizou os serviços da conta.");const claim=body.DisplayClaims.xui[0];return {authorization:`XBL3.0 x=${claim.uhs};${body.Token}`,xuid:String(claim.xid),token:body.Token,uhs:String(claim.uhs)} }
+async function xboxProfile(session:{authorization:string;xuid:string}){const response=await fetch("https://profile.xboxlive.com/users/batch/profile/settings",{method:"POST",headers:{authorization:session.authorization,"content-type":"application/json","x-xbl-contract-version":"2"},body:JSON.stringify({userIds:[session.xuid],settings:["GameDisplayName"]}),signal:AbortSignal.timeout(12000)});const body=await response.json().catch(()=>({}));if(!response.ok)throw new Error("Não foi possível carregar o perfil Xbox.");const profile=body.profileUsers?.[0];return {xuid:session.xuid,gamertag:String(profile?.settings?.find((setting:any)=>setting.id==="GameDisplayName")?.value||"")}}
+async function xboxSessionForUser(userId:string){
+  const connection=db.prepare("SELECT xuid,refresh_token FROM user_xbox_connections WHERE user_id=?").get(userId) as {xuid:string;refresh_token:string}|undefined;
+  if(!connection)throw new Error("Nenhuma conta Xbox conectada.");
+  const token=await xboxMicrosoftToken(new URLSearchParams({client_id:xboxClientId,client_secret:xboxClientSecret,refresh_token:decryptXboxToken(connection.refresh_token),grant_type:"refresh_token",scope:"xboxlive.signin xboxlive.offline_access"}));
+  const session=await xboxSessionFromAccessToken(token.access_token);
+  if(token.refresh_token)db.prepare("UPDATE user_xbox_connections SET refresh_token=?,xuid=?,last_synced_at=CURRENT_TIMESTAMP WHERE user_id=?").run(encryptXboxToken(token.refresh_token),session.xuid,userId);
+  return session;
 }
 async function createTasksLink(item:any){
   const prefix=item.media_type==="game"?"Jogar":item.content_category==="anime"?"Assistir anime":item.media_type==="tv"?"Assistir série":"Assistir";
@@ -379,6 +417,11 @@ async function fillMissingSteamIds(userId:string,items:any[]){
   if(!missing.length)return;
   try{const token=await getIgdbToken(),clientId=process.env.IGDB_CLIENT_ID||"";const body=`fields external_games.external_game_source.name,external_games.uid; where id=(${missing.join(",")}); limit ${missing.length};`;const response=await fetch("https://api.igdb.com/v4/games",{method:"POST",headers:{"Client-ID":clientId,Authorization:`Bearer ${token}`,"content-type":"text/plain"},body});if(!response.ok)return;for(const game of await response.json() as any[]){const appId=String((game.external_games||[]).find((entry:any)=>entry.external_game_source?.name==="Steam")?.uid||"");if(/^\d+$/.test(appId))db.prepare("UPDATE library_items SET steam_app_id=? WHERE user_id=? AND provider='igdb' AND external_id=?").run(appId,userId,String(game.id))}}catch{}
 }
+async function fillMissingXboxIds(userId:string,items:any[]){
+  const missing=items.filter(item=>item.provider==="igdb"&&!item.xbox_title_id).map(item=>Number(item.external_id)).filter(Boolean);
+  if(!missing.length)return;
+  try{const token=await getIgdbToken(),clientId=process.env.IGDB_CLIENT_ID||"";const body=`fields external_games.external_game_source.name,external_games.uid; where id=(${missing.join(",")}); limit ${missing.length};`;const response=await fetch("https://api.igdb.com/v4/games",{method:"POST",headers:{"Client-ID":clientId,Authorization:`Bearer ${token}`,"content-type":"text/plain"},body});if(!response.ok)return;for(const game of await response.json() as any[]){const titleId=String((game.external_games||[]).find((entry:any)=>/xbox|microsoft/i.test(String(entry.external_game_source?.name||"")))?.uid||"");if(/^\d+$/.test(titleId))db.prepare("UPDATE library_items SET xbox_title_id=? WHERE user_id=? AND provider='igdb' AND external_id=?").run(titleId,userId,String(game.id))}}catch{}
+}
 
 async function syncAchievementProgress(userId:string,items:any[]){
   if(!steamApiKey)return;
@@ -401,22 +444,27 @@ async function syncAchievementProgress(userId:string,items:any[]){
   }));
 }
 
+async function refreshUserData(userId:string){
+  await syncTasksCompletion(userId).catch(()=>0);
+  let items = db.prepare("SELECT * FROM library_items WHERE user_id = ? ORDER BY updated_at DESC").all(userId) as any[];
+  await Promise.all([fillMissingCreators(userId,items),fillMissingSteamIds(userId,items),fillMissingXboxIds(userId,items)]);
+  items = db.prepare("SELECT * FROM library_items WHERE user_id = ? ORDER BY updated_at DESC").all(userId) as any[];
+  await syncAchievementProgress(userId,items);
+}
+
 const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "32kb" }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/api/bootstrap", requireUser, async (req: AuthedRequest, res) => {
   db.prepare("UPDATE library_items SET status='completed' WHERE user_id=? AND status<>'completed' AND (rating>0 OR TRIM(notes)<>'')").run(req.userId);
-  await syncTasksCompletion(req.userId!).catch(()=>0);
-  let items = db.prepare("SELECT * FROM library_items WHERE user_id = ? ORDER BY updated_at DESC").all(req.userId) as any[];
-  await Promise.all([fillMissingCreators(req.userId!,items),fillMissingSteamIds(req.userId!,items)]);
-  items = db.prepare("SELECT * FROM library_items WHERE user_id = ? ORDER BY updated_at DESC").all(req.userId) as any[];
-  await syncAchievementProgress(req.userId!,items);
-  items = db.prepare("SELECT * FROM library_items WHERE user_id = ? ORDER BY updated_at DESC").all(req.userId) as any[];
+  const items = db.prepare("SELECT * FROM library_items WHERE user_id = ? ORDER BY updated_at DESC").all(req.userId) as any[];
   const lists = db.prepare(`SELECT l.id,l.name,l.description,l.icon,l.color,l.category,l.created_at createdAt,COUNT(li.item_id) itemCount
     FROM custom_lists l LEFT JOIN custom_list_items li ON li.list_id=l.id WHERE l.user_id=? GROUP BY l.id ORDER BY l.id`).all(req.userId);
   const steam=db.prepare("SELECT steam_id_64,connected_at,last_synced_at FROM user_steam_connections WHERE user_id=?").get(req.userId)||null;
-  res.json({ profile: req.profile, items, lists, steam:{ configured:Boolean(steamApiKey), connected:Boolean(steam), connection:steam }, providers: { games: Boolean(process.env.IGDB_CLIENT_ID && process.env.IGDB_CLIENT_SECRET), movies: Boolean(process.env.TMDB_READ_TOKEN) } });
+  const xbox=db.prepare("SELECT xuid,gamertag,connected_at,last_synced_at FROM user_xbox_connections WHERE user_id=?").get(req.userId)||null;
+  res.json({ profile: req.profile, items, lists, steam:{ configured:Boolean(steamApiKey), connected:Boolean(steam), connection:steam }, xbox:{ configured:Boolean(xboxClientId&&xboxClientSecret&&xboxTokenEncryptionKey), connected:Boolean(xbox), connection:xbox }, providers: { games: Boolean(process.env.IGDB_CLIENT_ID && process.env.IGDB_CLIENT_SECRET), movies: Boolean(process.env.TMDB_READ_TOKEN) } });
+  void refreshUserData(req.userId!).catch(()=>{});
 });
 app.post("/api/sync/tasks",requireUser,async(req:AuthedRequest,res)=>{try{const changed=await syncTasksCompletion(req.userId!);const items=db.prepare("SELECT * FROM library_items WHERE user_id=? ORDER BY updated_at DESC").all(req.userId);res.json({changed,items})}catch(error){res.status(502).json({error:error instanceof Error?error.message:"Falha ao sincronizar o PugotiTasks."})}});
 app.get("/api/search", requireUser, async (req, res) => {
@@ -556,6 +604,48 @@ app.get("/api/integrations/steam/callback",requireUser,async(req:AuthedRequest,r
   try{const validation=await fetch("https://steamcommunity.com/openid/login",{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:params});const result=await validation.text();if(!result.includes("is_valid:true"))throw new Error("invalid");const claimed=String(req.query["openid.claimed_id"]||"");const match=claimed.match(/^https:\/\/steamcommunity\.com\/openid\/id\/(\d{17})$/);if(!match)throw new Error("identity");db.prepare(`INSERT INTO user_steam_connections(user_id,steam_id_64) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET steam_id_64=excluded.steam_id_64,connected_at=CURRENT_TIMESTAMP`).run(req.userId,match[1]);res.redirect(`${saved.return_base||publicOrigin}/?steam=connected`)}catch{res.status(502).send("Não foi possível validar o login com a Steam.")}
 });
 app.delete("/api/integrations/steam",requireUser,(req:AuthedRequest,res)=>{db.prepare("DELETE FROM user_steam_connections WHERE user_id=?").run(req.userId);res.status(204).end()});
+app.get("/api/integrations/xbox/connect",requireUser,(req:AuthedRequest,res)=>{
+  if(!xboxClientId||!xboxClientSecret||!xboxTokenEncryptionKey)return res.status(503).send("A integração Xbox ainda não foi configurada no servidor.");
+  const requestedBase=String(req.query.base||publicOrigin).replace(/\/$/,"");
+  const returnBase=/^https:\/\/(?:[a-z0-9-]+\.)?pugotilab\.com(?:\/list)?$/i.test(requestedBase)?requestedBase:publicOrigin;
+  const state=crypto.randomBytes(24).toString("hex");
+  db.prepare("DELETE FROM xbox_oauth_states WHERE expires_at<?").run(Date.now());
+  db.prepare("INSERT INTO xbox_oauth_states(state,user_id,expires_at,return_base) VALUES(?,?,?,?)").run(state,req.userId,Date.now()+10*60_000,returnBase);
+  const url=new URL("https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize");
+  for(const [key,value] of Object.entries({client_id:xboxClientId,response_type:"code",redirect_uri:xboxRedirectUri,scope:"xboxlive.signin xboxlive.offline_access",state}))url.searchParams.set(key,value);
+  res.redirect(url.toString());
+});
+app.get("/api/integrations/xbox/callback",requireUser,async(req:AuthedRequest,res)=>{
+  const state=String(req.query.state||""),saved=db.prepare("SELECT user_id,expires_at,return_base FROM xbox_oauth_states WHERE state=?").get(state) as {user_id:string;expires_at:number;return_base:string}|undefined;
+  db.prepare("DELETE FROM xbox_oauth_states WHERE state=?").run(state);
+  if(!saved||saved.user_id!==req.userId||saved.expires_at<Date.now())return res.status(400).send("Conexão Xbox expirada. Volte ao PugotiList e tente novamente.");
+  try{
+    const code=String(req.query.code||"");if(!code)throw new Error("Código ausente.");
+    const token=await xboxMicrosoftToken(new URLSearchParams({client_id:xboxClientId,client_secret:xboxClientSecret,code,redirect_uri:xboxRedirectUri,grant_type:"authorization_code"}));
+    if(!token.refresh_token)throw new Error("A Microsoft não retornou refresh token.");
+    const session=await xboxSessionFromAccessToken(token.access_token),profile=await xboxProfile(session);
+    db.prepare(`INSERT INTO user_xbox_connections(user_id,xuid,gamertag,refresh_token) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET xuid=excluded.xuid,gamertag=excluded.gamertag,refresh_token=excluded.refresh_token,connected_at=CURRENT_TIMESTAMP`).run(req.userId,profile.xuid,profile.gamertag,encryptXboxToken(token.refresh_token));
+    res.redirect(`${saved.return_base||publicOrigin}/?xbox=connected`);
+  }catch(error){res.status(502).send(error instanceof Error?error.message:"Não foi possível conectar a conta Xbox.")}
+});
+app.delete("/api/integrations/xbox",requireUser,(req:AuthedRequest,res)=>{db.prepare("DELETE FROM user_xbox_connections WHERE user_id=?").run(req.userId);res.status(204).end()});
+app.get("/api/integrations/xbox/profile",requireUser,async(req:AuthedRequest,res)=>{
+  if(!xboxClientId||!xboxClientSecret||!xboxTokenEncryptionKey)return res.status(503).json({error:"A integração Xbox ainda não foi configurada no servidor."});
+  const connection=db.prepare("SELECT * FROM user_xbox_connections WHERE user_id=?").get(req.userId) as {xuid:string;gamertag:string;refresh_token:string}|undefined;
+  if(!connection)return res.status(404).json({error:"Nenhuma conta Xbox conectada."});
+  try{const token=await xboxMicrosoftToken(new URLSearchParams({client_id:xboxClientId,client_secret:xboxClientSecret,refresh_token:decryptXboxToken(connection.refresh_token),grant_type:"refresh_token",scope:"xboxlive.signin xboxlive.offline_access"}));const session=await xboxSessionFromAccessToken(token.access_token),profile=await xboxProfile(session);if(token.refresh_token)db.prepare("UPDATE user_xbox_connections SET refresh_token=?,xuid=?,gamertag=?,last_synced_at=CURRENT_TIMESTAMP WHERE user_id=?").run(encryptXboxToken(token.refresh_token),profile.xuid,profile.gamertag,req.userId);res.json({connected:true,...profile})}catch{res.status(502).json({error:"Não foi possível atualizar o perfil Xbox."})}
+});
+app.get("/api/games/:id/xbox-achievements",requireUser,async(req:AuthedRequest,res)=>{
+  if(!xboxClientId||!xboxClientSecret||!xboxTokenEncryptionKey)return res.status(503).json({error:"A integração Xbox ainda não foi configurada no servidor."});
+  const item=db.prepare("SELECT xbox_title_id,title FROM library_items WHERE id=? AND user_id=? AND media_type='game'").get(req.params.id,req.userId) as {xbox_title_id:string;title:string}|undefined;
+  if(!item?.xbox_title_id)return res.status(404).json({error:"Este jogo ainda não foi associado à versão Xbox."});
+  try{
+    const session=await xboxSessionForUser(req.userId!),url=new URL(`https://achievements.xboxlive.com/users/xuid(${encodeURIComponent(session.xuid)})/achievements`);
+    url.searchParams.set("titleId",item.xbox_title_id);url.searchParams.set("maxItems","500");url.searchParams.set("orderBy","Title");
+    const response=await fetch(url,{headers:{authorization:session.authorization,"x-xbl-contract-version":"2","accept-language":"pt-BR,pt;q=0.9"},signal:AbortSignal.timeout(15000)});const body=await response.json().catch(()=>({}));if(!response.ok)throw new Error("Xbox indisponível.");
+    const achievements=(body.achievements||[]).map((achievement:any)=>{const progress=achievement.progression?.requirements?.[0]?.current||0,total=achievement.progression?.requirements?.[0]?.target||0;const unlocked=achievement.progressState==="Achieved"||achievement.progressState==="Unlocked";const assets=achievement.mediaAssets||[];const assetUrl=(names:string[])=>assets.find((asset:any)=>names.includes(String(asset.name||"").toLowerCase()))?.url||assets[0]?.url||"";return{id:String(achievement.id||achievement.name),name:achievement.name||"Conquista",description:achievement.description||"",iconUrl:assetUrl(["xbox-achievement-unlocked","achievement_unlocked"]),lockedIconUrl:assetUrl(["xbox-achievement-locked","achievement_locked"]),unlocked,progress:total?`${progress}/${total}`:"",unlockedAt:achievement.unlockedDate||null,gamerscore:Number(achievement.rewards?.[0]?.value||0)}});const unlocked=achievements.filter((achievement:any)=>achievement.unlocked).length;db.prepare("UPDATE library_items SET xbox_achievement_total=?,xbox_achievement_unlocked=?,xbox_achievements_synced_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?").run(achievements.length,unlocked,req.params.id,req.userId);res.json({xboxTitleId:item.xbox_title_id,connected:true,gameName:item.title,total:achievements.length,unlocked,completionPercent:achievements.length?Math.round(unlocked/achievements.length*100):0,achievements});
+  }catch(error){res.status(502).json({error:error instanceof Error?error.message:"O Xbox não respondeu com as conquistas."})}
+});
 app.get("/api/games/:id/achievements",requireUser,async(req:AuthedRequest,res)=>{
   if(!steamApiKey)return res.status(503).json({error:"A chave da Steam ainda não foi configurada no servidor."});
   const item=db.prepare("SELECT steam_app_id FROM library_items WHERE id=? AND user_id=? AND media_type='game'").get(req.params.id,req.userId) as {steam_app_id:string}|undefined;

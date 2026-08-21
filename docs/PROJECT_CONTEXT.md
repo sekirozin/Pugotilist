@@ -24,7 +24,7 @@ Usuário → public/app.js → /api/* → requireUser
        → JSON → renderização DOM
 ```
 
-`GET /api/bootstrap` carrega perfil, biblioteca, listas, estado Steam e disponibilidade de provedores. O frontend renderiza o shell e registra listeners diretamente no DOM.
+`GET /api/bootstrap` carrega perfil, biblioteca, listas, estado Steam e disponibilidade de provedores e responde antes das sincronizações externas pesadas. `refreshUserData()` atualiza Tasks, criadores, IDs Steam e progresso de conquistas em segundo plano. O frontend renderiza o shell, registra listeners diretamente no DOM e chama `enhanceRenderedDom()` após cada renderização.
 
 ## Funcionalidades atuais
 
@@ -36,6 +36,7 @@ Usuário → public/app.js → /api/* → requireUser
 - Listas customizadas com categoria, ícone, cor, ordenação drag-and-drop e integração opcional PugotiTasks.
 - Recomendações separadas por categoria usando obras avaliadas como sementes; limite apresentado no frontend é 18 por grupo.
 - Steam: OpenID para vincular conta, Steam Web API para conquistas e consulta de guias da Comunidade Steam.
+- Xbox: conexão Microsoft OAuth/Xbox Live implementada, com identificação de XUID/gamertag, refresh token cifrado por usuário e aba de conquistas Xbox nos detalhes dos jogos; depende das credenciais do aplicativo no ambiente.
 - Plataforma jogada armazenada como `steam`, `playstation`, `xbox`, `nintendo` ou vazio. Isso é metadado manual; não implica sincronização de console.
 
 ## Frontend
@@ -83,6 +84,8 @@ Local: `npm install`, `npm run dev`; produção: `npm run build` e `npm start`. 
 
 - `server.ts` é um módulo grande e centralizado; alterações têm impacto amplo.
 - O status pode ser promovido para concluído quando há nota/review e também é sincronizado com PugotiTasks.
-- Conquistas só são automáticas para jogos com Steam App ID e conexão Steam; as plataformas PlayStation/Xbox/Nintendo são apenas metadados hoje.
-- Chamadas externas ocorrem durante bootstrap/detalhes; preserve timeouts e tratamento de falhas.
+- Conquistas automáticas estão disponíveis para Steam e, com a configuração Xbox ativa, para jogos associados a um Xbox title ID; PlayStation/Nintendo permanecem apenas como metadados.
+- A integração Xbox permanece desativada até configurar `XBOX_CLIENT_ID`, `XBOX_CLIENT_SECRET` e `XBOX_TOKEN_ENCRYPTION_KEY` no ambiente de produção.
+- Chamadas externas de atualização ocorrem em segundo plano após bootstrap; preserve timeouts e tratamento de falhas para não bloquear a entrada.
+- O `MutationObserver` global foi removido em 16/08/2026 por causar trabalho excessivo no Firefox; não reintroduzi-lo sem medição.
 - Não confundir o banco principal com o cache Jellyfin.

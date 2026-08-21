@@ -107,3 +107,39 @@ Uma plataforma selecionada no card não implica autenticação ou progresso sinc
 ### Cuidados
 
 Não prometer suporte a troféus/conquistas PlayStation, Xbox ou Nintendo sem integração específica e análise de segurança. Motivação original: **NÃO CONFIRMADA**.
+
+## Bootstrap não bloqueia a interface com sincronizações externas
+
+### Estado atual
+
+`GET /api/bootstrap` retorna os dados básicos imediatamente. A função `refreshUserData()` executa sincronização PugotiTasks, preenchimento de metadados e progresso Steam em segundo plano.
+
+### Evidências no projeto
+
+`src/server.ts`, função `refreshUserData()` e handler `/api/bootstrap`.
+
+### Impacto
+
+Falhas ou lentidão de TMDB, IGDB, AniList, Steam ou PugotiTasks não devem impedir a primeira renderização da biblioteca.
+
+### Cuidados
+
+Não mover chamadas externas pesadas de volta para o caminho síncrono do bootstrap sem medir o tempo de entrada e os timeouts.
+
+## Aprimoramentos do DOM explícitos, sem MutationObserver global
+
+### Estado atual
+
+`public/app.js` chama `enhanceRenderedDom()` uma vez após `render()`. O observador que acompanhava toda a subárvore de `#app` foi removido.
+
+### Evidências no projeto
+
+`public/app.js`, função `enhanceRenderedDom()` e final de `render()`.
+
+### Impacto
+
+Reduz trabalho repetido no thread principal e evita que mutações de cards/menus provoquem ciclos de observação no Firefox.
+
+### Cuidados
+
+Novos elementos criados por uma mudança devem ser aprimorados explicitamente ou durante o render; não adicionar um observer global sem demonstrar necessidade e medir impacto.

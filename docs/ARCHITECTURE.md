@@ -31,7 +31,7 @@
 - Steam: tabelas de conexão/estado e handlers de OpenID, conquistas e guias.
 - Frontend: funções de `public/app.js`; não há módulos de componentes separados.
 
-Dependência principal: renderização chama `bind()`, e vários aprimoramentos pós-render usam `MutationObserver`. O backend centraliza regras, persistência e integrações; não há service layer independente.
+Dependência principal: renderização chama `bind()` e `enhanceRenderedDom()` explicitamente. O backend centraliza regras, persistência e integrações; não há service layer independente. O `MutationObserver` global foi removido por custo de CPU/DOM no Firefox.
 
 ## Fluxos importantes
 
@@ -40,8 +40,9 @@ Dependência principal: renderização chama `bind()`, e vários aprimoramentos 
 1. Browser chama `/api/bootstrap`.
 2. `requireUser` encaminha cookie a `PUGOTILAB_PROFILE_URL`.
 3. O perfil define `req.userId`.
-4. Bootstrap sincroniza tarefas, preenche criadores/Steam IDs, progresso Steam e retorna dados filtrados por usuário.
-5. Frontend aplica `Object.assign(state, data)` e renderiza.
+4. Bootstrap retorna dados filtrados por usuário sem aguardar sincronizações externas pesadas.
+5. Frontend aplica `Object.assign(state, data)`, renderiza e aprimora o DOM explicitamente.
+6. `refreshUserData()` atualiza Tasks, criadores/Steam IDs e progresso Steam em segundo plano.
 
 ### Pesquisa e detalhes
 
@@ -87,5 +88,5 @@ O início guarda estado OpenID; callback valida com Steam, extrai SteamID64 e sa
 - `requireUser` é pré-condição de quase toda a API; remover ou alterar filtragem por `user_id` causa risco de exposição entre usuários.
 - O schema é aplicado no boot e usa SQLite WAL/foreign keys; alterações precisam ser compatíveis com bancos existentes.
 - `better-sqlite3` é nativo e o Docker instala compiladores para o build.
-- `render()` substitui o DOM inteiro; listeners precisam ser reanexados por `bind()` e mutações pós-render devem evitar loops.
+- `render()` substitui o DOM inteiro; listeners precisam ser reanexados por `bind()` e os aprimoramentos pós-render devem passar por `enhanceRenderedDom()` sem observer global.
 - Bootstrap executa sincronizações externas; aumentar chamadas ou retirar timeouts pode deixar a UI bloqueada.
