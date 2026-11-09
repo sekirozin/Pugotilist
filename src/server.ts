@@ -23,13 +23,31 @@ const tasksTokenFile = path.join(path.dirname(dbFile), "pugotitasks-token");
 const tasksApiToken = process.env.PUGOTITASKS_API_TOKEN || (fs.existsSync(tasksTokenFile) ? fs.readFileSync(tasksTokenFile,"utf8").trim() : "");
 fs.mkdirSync(path.dirname(dbFile), { recursive: true });
 
+async function mapWithConcurrency<T, R>(values: T[], limit: number, worker: (value: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let cursor = 0;
+  async function run() {
+    while (true) {
+      const index = cursor++;
+      if (index >= values.length) return;
+      results[index] = await worker(values[index]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(Math.max(limit, 1), values.length) }, () => run()));
+  return results;
+}
+
 const db = new Database(dbFile);
 const jellyfinCacheFile = path.join(path.dirname(dbFile), "jellyfin-cache.db");
 let jellyfinDb: Database.Database | null = null;
 let jellyfinCacheMtime = 0;
+let jellyfinLastCheck = 0;
 function getJellyfinDb() {
   if (!jellyfinDbFile || !fs.existsSync(jellyfinDbFile)) return null;
   try {
+    const now = Date.now();
+    if (jellyfinDb && now - jellyfinLastCheck < 5000) return jellyfinDb;
+    jellyfinLastCheck = now;
     const sourceMtime = fs.statSync(jellyfinDbFile).mtimeMs;
     if (!jellyfinDb || sourceMtime !== jellyfinCacheMtime) {
       fs.copyFileSync(jellyfinDbFile, jellyfinCacheFile);
@@ -116,13 +134,9 @@ if (!libraryColumns.some(column=>column.name==="play_platform")) db.exec("ALTER 
 if (!libraryColumns.some(column=>column.name==="creator_name")) db.exec("ALTER TABLE library_items ADD COLUMN creator_name TEXT NOT NULL DEFAULT ''");
 if (!libraryColumns.some(column=>column.name==="content_category")) db.exec("ALTER TABLE library_items ADD COLUMN content_category TEXT NOT NULL DEFAULT ''");
 if (!libraryColumns.some(column=>column.name==="steam_app_id")) db.exec("ALTER TABLE library_items ADD COLUMN steam_app_id TEXT NOT NULL DEFAULT ''");
-if (!libraryColumns.some(column=>column.name==="xbox_title_id")) db.exec("ALTER TABLE library_items ADD COLUMN xbox_title_id TEXT NOT NULL DEFAULT ''");
 if (!libraryColumns.some(column=>column.name==="achievement_total")) db.exec("ALTER TABLE library_items ADD COLUMN achievement_total INTEGER NOT NULL DEFAULT 0");
 if (!libraryColumns.some(column=>column.name==="achievement_unlocked")) db.exec("ALTER TABLE library_items ADD COLUMN achievement_unlocked INTEGER NOT NULL DEFAULT 0");
 if (!libraryColumns.some(column=>column.name==="achievements_synced_at")) db.exec("ALTER TABLE library_items ADD COLUMN achievements_synced_at TEXT NOT NULL DEFAULT ''");
-if (!libraryColumns.some(column=>column.name==="xbox_achievement_total")) db.exec("ALTER TABLE library_items ADD COLUMN xbox_achievement_total INTEGER NOT NULL DEFAULT 0");
-if (!libraryColumns.some(column=>column.name==="xbox_achievement_unlocked")) db.exec("ALTER TABLE library_items ADD COLUMN xbox_achievement_unlocked INTEGER NOT NULL DEFAULT 0");
-if (!libraryColumns.some(column=>column.name==="xbox_achievements_synced_at")) db.exec("ALTER TABLE library_items ADD COLUMN xbox_achievements_synced_at TEXT NOT NULL DEFAULT ''");
 if (!libraryColumns.some(column=>column.name==="work_situation")) db.exec("ALTER TABLE library_items ADD COLUMN work_situation TEXT NOT NULL DEFAULT ''");
 const steamStateColumns=db.prepare("PRAGMA table_info(steam_openid_states)").all() as {name:string}[];
 if(!steamStateColumns.some(column=>column.name==="return_base"))db.exec("ALTER TABLE steam_openid_states ADD COLUMN return_base TEXT NOT NULL DEFAULT ''");
@@ -134,10 +148,10 @@ const customItemColumns=db.prepare("PRAGMA table_info(custom_list_items)").all()
 if(!customItemColumns.some(column=>column.name==="task_id"))db.exec("ALTER TABLE custom_list_items ADD COLUMN task_id TEXT NOT NULL DEFAULT ''");
 
 async function tasksApi(pathname:string,options:RequestInit={}){
-  if(!tasksApiToken)throw new Error("Integração com PugotiTasks não configurada.");
+  if(!tasksApiToken)throw new Error("Integração com Pugotitasks não configurada.");
   const response=await fetch(`${tasksApiUrl}${pathname}`,{...options,headers:{authorization:`Bearer ${tasksApiToken}`,"content-type":"application/json",...(options.headers||{})},signal:AbortSignal.timeout(10000)});
   const body=await response.json().catch(()=>({}));
-  if(!response.ok)throw new Error(body.error||"PugotiTasks indisponível.");
+  if(!response.ok)throw new Error(body.error||"Pugotitasks indisponível.");
   return body as any;
 }
 function xboxCipherKey(){if(!xboxTokenEncryptionKey)throw new Error("Integração Xbox sem chave de proteção configurada.");return crypto.createHash("sha256").update(xboxTokenEncryptionKey).digest()}
@@ -148,17 +162,9 @@ async function xboxUserToken(accessToken:string){const response=await fetch("htt
 }
 async function xboxSessionFromAccessToken(accessToken:string){const user=await xboxUserToken(accessToken);const response=await fetch("https://xsts.auth.xboxlive.com/xsts/authorize",{method:"POST",headers:{"content-type":"application/json","x-xbl-contract-version":"1"},body:JSON.stringify({Properties:{SandboxId:"RETAIL",UserTokens:[user.Token]},RelyingParty:"http://xboxlive.com",TokenType:"JWT"}),signal:AbortSignal.timeout(15000)});const body=await response.json().catch(()=>({}));if(!response.ok||!body.Token||!body.DisplayClaims?.xui?.[0]?.xid||!body.DisplayClaims?.xui?.[0]?.uhs)throw new Error("O Xbox não autorizou os serviços da conta.");const claim=body.DisplayClaims.xui[0];return {authorization:`XBL3.0 x=${claim.uhs};${body.Token}`,xuid:String(claim.xid),token:body.Token,uhs:String(claim.uhs)} }
 async function xboxProfile(session:{authorization:string;xuid:string}){const response=await fetch("https://profile.xboxlive.com/users/batch/profile/settings",{method:"POST",headers:{authorization:session.authorization,"content-type":"application/json","x-xbl-contract-version":"2"},body:JSON.stringify({userIds:[session.xuid],settings:["GameDisplayName"]}),signal:AbortSignal.timeout(12000)});const body=await response.json().catch(()=>({}));if(!response.ok)throw new Error("Não foi possível carregar o perfil Xbox.");const profile=body.profileUsers?.[0];return {xuid:session.xuid,gamertag:String(profile?.settings?.find((setting:any)=>setting.id==="GameDisplayName")?.value||"")}}
-async function xboxSessionForUser(userId:string){
-  const connection=db.prepare("SELECT xuid,refresh_token FROM user_xbox_connections WHERE user_id=?").get(userId) as {xuid:string;refresh_token:string}|undefined;
-  if(!connection)throw new Error("Nenhuma conta Xbox conectada.");
-  const token=await xboxMicrosoftToken(new URLSearchParams({client_id:xboxClientId,client_secret:xboxClientSecret,refresh_token:decryptXboxToken(connection.refresh_token),grant_type:"refresh_token",scope:"xboxlive.signin xboxlive.offline_access"}));
-  const session=await xboxSessionFromAccessToken(token.access_token);
-  if(token.refresh_token)db.prepare("UPDATE user_xbox_connections SET refresh_token=?,xuid=?,last_synced_at=CURRENT_TIMESTAMP WHERE user_id=?").run(encryptXboxToken(token.refresh_token),session.xuid,userId);
-  return session;
-}
 async function createTasksLink(item:any){
   const prefix=item.media_type==="game"?"Jogar":item.content_category==="anime"?"Assistir anime":item.media_type==="tv"?"Assistir série":"Assistir";
-  const body=await tasksApi("/tasks",{method:"POST",body:JSON.stringify({title:`${prefix} - ${item.title}`,folderName:"Assistir mais tarde",notes:`Criado pelo PugotiList · ${item.provider}:${item.external_id}`})});
+  const body=await tasksApi("/tasks",{method:"POST",body:JSON.stringify({title:`${prefix} - ${item.title}`,folderName:"Assistir mais tarde",notes:`Criado pelo Pugotilist · ${item.provider}:${item.external_id}`})});
   return String(body.task.id);
 }
 async function syncTasksCompletion(userId:string){
@@ -188,16 +194,16 @@ type AuthedRequest = Request & { profile?: Profile; userId?: string };
 async function requireUser(req: AuthedRequest, res: Response, next: NextFunction) {
   try {
     const response = await fetch(profileUrl, { headers: { cookie: req.headers.cookie || "", accept: "application/json" } });
-    if (!response.ok) return res.status(401).json({ error: "Entre com sua conta PugotiLab.", loginUrl });
+    if (!response.ok) return res.status(401).json({ error: "Entre com sua conta Pugotilab.", loginUrl });
     const body = await response.json() as Profile | { profile: Profile };
     const profile = "profile" in body ? body.profile : body;
     const id = profile.id ?? profile.userId ?? profile.username;
-    if (!id || !profile.username) return res.status(401).json({ error: "Perfil PugotiLab inválido.", loginUrl });
+    if (!id || !profile.username) return res.status(401).json({ error: "Perfil Pugotilab inválido.", loginUrl });
     req.profile = profile;
     req.userId = String(id);
     next();
   } catch {
-    res.status(503).json({ error: "A identidade PugotiLab está temporariamente indisponível." });
+    res.status(503).json({ error: "A identidade Pugotilab está temporariamente indisponível." });
   }
 }
 
@@ -265,7 +271,7 @@ async function recommendIgdb(ids: string[]) {
 async function recommendTmdb(seeds: { external_id:string; media_type:"movie"|"tv" }[], contentCategory: "movie"|"tv"|"anime") {
   const token = process.env.TMDB_READ_TOKEN;
   if (!token) return [];
-  const lists = await Promise.all(seeds.map(async seed => {
+  const lists = await mapWithConcurrency(seeds, 2, async seed => {
     const url = new URL(`https://api.themoviedb.org/3/${seed.media_type}/${seed.external_id}/recommendations`);
     url.searchParams.set("language", "pt-BR");
     const response = await fetch(url, { headers:{ Authorization:`Bearer ${token}`, accept:"application/json" } });
@@ -274,7 +280,7 @@ async function recommendTmdb(seeds: { external_id:string; media_type:"movie"|"tv
     return (data.results||[]).slice(0,12)
       .filter((item:any)=>contentCategory!=="anime" || ((item.genre_ids||[]).includes(16) && (item.origin_country||[]).includes("JP")))
       .map((item:any) => ({ provider:"tmdb", mediaType:seed.media_type, contentCategory, externalId:String(item.id), title:item.title||item.name, overview:item.overview||"Sinopse indisponível.", posterUrl:item.poster_path?`https://image.tmdb.org/t/p/w500${item.poster_path}`:"", backdropUrl:item.backdrop_path?`https://image.tmdb.org/t/p/w1280${item.backdrop_path}`:"", releaseYear:(item.release_date||item.first_air_date||"").slice(0,4), score:item.vote_average||0 }));
-  }));
+  });
   return lists.flat();
 }
 
@@ -407,20 +413,15 @@ async function fillMissingCreators(userId: string, items: any[]) {
     } catch {}
   }
   const tmdbItems=missing.filter(item=>item.provider==="tmdb");
-  await Promise.all(tmdbItems.map(async item=>{
+  await mapWithConcurrency(tmdbItems, 2, async item=>{
     try {const details=await detailsTmdb(item.external_id,item.media_type==="tv"?"tv":"movie");const name=details.directors?.[0]||"";if(name)db.prepare("UPDATE library_items SET creator_name=? WHERE id=? AND user_id=?").run(name,item.id,userId)} catch {}
-  }));
+  });
 }
 
 async function fillMissingSteamIds(userId:string,items:any[]){
   const missing=items.filter(item=>item.provider==="igdb"&&!item.steam_app_id).map(item=>Number(item.external_id)).filter(Boolean);
   if(!missing.length)return;
   try{const token=await getIgdbToken(),clientId=process.env.IGDB_CLIENT_ID||"";const body=`fields external_games.external_game_source.name,external_games.uid; where id=(${missing.join(",")}); limit ${missing.length};`;const response=await fetch("https://api.igdb.com/v4/games",{method:"POST",headers:{"Client-ID":clientId,Authorization:`Bearer ${token}`,"content-type":"text/plain"},body});if(!response.ok)return;for(const game of await response.json() as any[]){const appId=String((game.external_games||[]).find((entry:any)=>entry.external_game_source?.name==="Steam")?.uid||"");if(/^\d+$/.test(appId))db.prepare("UPDATE library_items SET steam_app_id=? WHERE user_id=? AND provider='igdb' AND external_id=?").run(appId,userId,String(game.id))}}catch{}
-}
-async function fillMissingXboxIds(userId:string,items:any[]){
-  const missing=items.filter(item=>item.provider==="igdb"&&!item.xbox_title_id).map(item=>Number(item.external_id)).filter(Boolean);
-  if(!missing.length)return;
-  try{const token=await getIgdbToken(),clientId=process.env.IGDB_CLIENT_ID||"";const body=`fields external_games.external_game_source.name,external_games.uid; where id=(${missing.join(",")}); limit ${missing.length};`;const response=await fetch("https://api.igdb.com/v4/games",{method:"POST",headers:{"Client-ID":clientId,Authorization:`Bearer ${token}`,"content-type":"text/plain"},body});if(!response.ok)return;for(const game of await response.json() as any[]){const titleId=String((game.external_games||[]).find((entry:any)=>/xbox|microsoft/i.test(String(entry.external_game_source?.name||"")))?.uid||"");if(/^\d+$/.test(titleId))db.prepare("UPDATE library_items SET xbox_title_id=? WHERE user_id=? AND provider='igdb' AND external_id=?").run(titleId,userId,String(game.id))}}catch{}
 }
 
 async function syncAchievementProgress(userId:string,items:any[]){
@@ -429,7 +430,7 @@ async function syncAchievementProgress(userId:string,items:any[]){
   if(!connection)return;
   const staleBefore=Date.now()-15*60_000;
   const games=items.filter(item=>item.media_type==="game"&&/^\d+$/.test(item.steam_app_id||"")&&(!item.achievements_synced_at||Date.parse(item.achievements_synced_at)<staleBefore));
-  await Promise.all(games.map(async item=>{
+  await mapWithConcurrency(games, 2, async item=>{
     try{
       const url=new URL("https://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v1/");
       for(const [key,value] of Object.entries({key:steamApiKey,steamid:connection.steam_id_64,appid:item.steam_app_id,l:"brazilian"}))url.searchParams.set(key,value);
@@ -441,21 +442,63 @@ async function syncAchievementProgress(userId:string,items:any[]){
       const unlocked=achievements.filter((achievement:any)=>achievement.achieved).length;
       db.prepare("UPDATE library_items SET achievement_total=?,achievement_unlocked=?,achievements_synced_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?").run(achievements.length,unlocked,item.id,userId);
     }catch{}
-  }));
+  });
 }
 
 async function refreshUserData(userId:string){
-  await syncTasksCompletion(userId).catch(()=>0);
+  await syncTasksOnce(userId).catch(()=>0);
   let items = db.prepare("SELECT * FROM library_items WHERE user_id = ? ORDER BY updated_at DESC").all(userId) as any[];
-  await Promise.all([fillMissingCreators(userId,items),fillMissingSteamIds(userId,items),fillMissingXboxIds(userId,items)]);
+  await Promise.all([fillMissingCreators(userId,items),fillMissingSteamIds(userId,items)]);
   items = db.prepare("SELECT * FROM library_items WHERE user_id = ? ORDER BY updated_at DESC").all(userId) as any[];
   await syncAchievementProgress(userId,items);
+}
+
+const refreshInFlight = new Map<string, Promise<void>>();
+const refreshLastStarted = new Map<string, number>();
+function scheduleRefreshUserData(userId:string) {
+  const current = refreshInFlight.get(userId);
+  if (current) return current;
+  const lastStarted = refreshLastStarted.get(userId) || 0;
+  if (Date.now() - lastStarted < 60_000) return;
+  refreshLastStarted.set(userId, Date.now());
+  const job = refreshUserData(userId).finally(() => refreshInFlight.delete(userId));
+  refreshInFlight.set(userId, job);
+  return job;
+}
+
+const tasksSyncInFlight = new Map<string, Promise<number>>();
+function syncTasksOnce(userId:string) {
+  const current = tasksSyncInFlight.get(userId);
+  if (current) return current;
+  const job = syncTasksCompletion(userId).finally(() => tasksSyncInFlight.delete(userId));
+  tasksSyncInFlight.set(userId, job);
+  return job;
 }
 
 const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "32kb" }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
+
+// Resumo do Pugoti Profile ("Listas no Pugotilist"): o auth consulta pela rede interna com o token próprio.
+// Token pela variável de ambiente ou pelo arquivo data/pugotilab-resumo-token (sem recriar o contêiner).
+const resumoToken = process.env.PUGOTILAB_RESUMO_TOKEN || (() => { try { return fs.readFileSync(path.join(path.dirname(dbFile), "pugotilab-resumo-token"), "utf8").trim(); } catch { return ""; } })();
+app.get("/api/pugotilab/listas/:userId", (req: any, res: any) => {
+    const token = String(req.headers["x-pugotilab-resumo"] || "");
+    if (!resumoToken || token.length !== resumoToken.length || !crypto.timingSafeEqual(Buffer.from(token), Buffer.from(resumoToken)))
+        return res.status(401).json({ error: "Token inválido." });
+    const listas = db.prepare(`SELECT l.id, l.name, l.description, COUNT(i.item_id) AS total,
+        (SELECT li.poster_url FROM custom_list_items ci JOIN library_items li ON li.id = ci.item_id WHERE ci.list_id = l.id AND li.poster_url <> '' ORDER BY ci.position, ci.added_at LIMIT 1) AS capa
+      FROM custom_lists l LEFT JOIN custom_list_items i ON i.list_id = l.id
+      WHERE l.user_id = ? GROUP BY l.id ORDER BY l.created_at DESC LIMIT 8`).all(String(req.params.userId));
+    const andamento = db.prepare(`SELECT title, poster_url, media_type FROM library_items WHERE user_id = ? AND status = 'in_progress'
+      ORDER BY updated_at DESC LIMIT 8`).all(String(req.params.userId));
+    const tipo: Record<string, string> = { movie: "Filme", tv: "Série", game: "Jogo" };
+    res.json({
+        lists: (listas as any[]).map((l) => ({ title: l.name, detail: `${l.total} ${l.total === 1 ? "item" : "itens"}`, imageUrl: l.capa || "", url: "https://list.pugotilab.com/" })),
+        inProgress: (andamento as any[]).map((i) => ({ title: i.title, detail: `${tipo[i.media_type] || ""} em andamento`.trim(), imageUrl: i.poster_url || "", url: "https://list.pugotilab.com/" }))
+    });
+});
 app.get("/api/bootstrap", requireUser, async (req: AuthedRequest, res) => {
   db.prepare("UPDATE library_items SET status='completed' WHERE user_id=? AND status<>'completed' AND (rating>0 OR TRIM(notes)<>'')").run(req.userId);
   const items = db.prepare("SELECT * FROM library_items WHERE user_id = ? ORDER BY updated_at DESC").all(req.userId) as any[];
@@ -464,9 +507,9 @@ app.get("/api/bootstrap", requireUser, async (req: AuthedRequest, res) => {
   const steam=db.prepare("SELECT steam_id_64,connected_at,last_synced_at FROM user_steam_connections WHERE user_id=?").get(req.userId)||null;
   const xbox=db.prepare("SELECT xuid,gamertag,connected_at,last_synced_at FROM user_xbox_connections WHERE user_id=?").get(req.userId)||null;
   res.json({ profile: req.profile, items, lists, steam:{ configured:Boolean(steamApiKey), connected:Boolean(steam), connection:steam }, xbox:{ configured:Boolean(xboxClientId&&xboxClientSecret&&xboxTokenEncryptionKey), connected:Boolean(xbox), connection:xbox }, providers: { games: Boolean(process.env.IGDB_CLIENT_ID && process.env.IGDB_CLIENT_SECRET), movies: Boolean(process.env.TMDB_READ_TOKEN) } });
-  void refreshUserData(req.userId!).catch(()=>{});
+  void scheduleRefreshUserData(req.userId!)?.catch(()=>{});
 });
-app.post("/api/sync/tasks",requireUser,async(req:AuthedRequest,res)=>{try{const changed=await syncTasksCompletion(req.userId!);const items=db.prepare("SELECT * FROM library_items WHERE user_id=? ORDER BY updated_at DESC").all(req.userId);res.json({changed,items})}catch(error){res.status(502).json({error:error instanceof Error?error.message:"Falha ao sincronizar o PugotiTasks."})}});
+app.post("/api/sync/tasks",requireUser,async(req:AuthedRequest,res)=>{try{const changed=await syncTasksOnce(req.userId!);const items=db.prepare("SELECT * FROM library_items WHERE user_id=? ORDER BY updated_at DESC").all(req.userId);res.json({changed,items})}catch(error){res.status(502).json({error:error instanceof Error?error.message:"Falha ao sincronizar o Pugotitasks."})}});
 app.get("/api/search", requireUser, async (req, res) => {
   const query = String(req.query.q || "").trim().slice(0, 100);
   const type = String(req.query.type || "game");
@@ -580,7 +623,7 @@ app.post("/api/lists/:id/items/:itemId", requireUser, async (req: AuthedRequest,
   const existing=db.prepare("SELECT 1 FROM custom_list_items WHERE list_id=? AND item_id=?").get(req.params.id,req.params.itemId);if(existing)return res.status(409).json({error:"Esta obra já está na lista."});
   const position=(db.prepare("SELECT COALESCE(MAX(position),-1)+1 value FROM custom_list_items WHERE list_id=?").get(req.params.id) as any).value;
   const linked=db.prepare("SELECT li.task_id FROM custom_list_items li JOIN custom_lists l ON l.id=li.list_id WHERE li.item_id=? AND l.user_id=? AND li.task_id<>'' LIMIT 1").get(req.params.itemId,req.userId) as any;
-  let taskId=String(linked?.task_id||"");if(!taskId)try{taskId=await createTasksLink(item)}catch(error){return res.status(502).json({error:error instanceof Error?error.message:"Falha no PugotiTasks."})}
+  let taskId=String(linked?.task_id||"");if(!taskId)try{taskId=await createTasksLink(item)}catch(error){return res.status(502).json({error:error instanceof Error?error.message:"Falha no Pugotitasks."})}
   db.prepare("INSERT INTO custom_list_items(list_id,item_id,position,task_id) VALUES(?,?,?,?)").run(req.params.id,req.params.itemId,position,taskId);res.status(201).json({taskId});
 });
 app.delete("/api/lists/:id/items/:itemId",requireUser,async(req:AuthedRequest,res)=>{const row=db.prepare("SELECT li.task_id FROM custom_list_items li JOIN custom_lists l ON l.id=li.list_id WHERE li.list_id=? AND li.item_id=? AND l.user_id=?").get(req.params.id,req.params.itemId,req.userId) as any;if(!row)return res.status(404).json({error:"Item não encontrado."});db.prepare("DELETE FROM custom_list_items WHERE list_id=? AND item_id=?").run(req.params.id,req.params.itemId);const stillLinked=row.task_id&&db.prepare("SELECT 1 FROM custom_list_items li JOIN custom_lists l ON l.id=li.list_id WHERE li.item_id=? AND li.task_id=? AND l.user_id=?").get(req.params.itemId,row.task_id,req.userId);if(row.task_id&&!stillLinked)await tasksApi(`/tasks/${row.task_id}`,{method:"DELETE"}).catch(()=>null);res.status(204).end();});
@@ -599,7 +642,7 @@ app.get("/api/integrations/steam/connect", requireUser, (req:AuthedRequest,res)=
 app.get("/api/integrations/steam/callback",requireUser,async(req:AuthedRequest,res)=>{
   const state=String(req.query.state||""),saved=db.prepare("SELECT user_id,expires_at,return_base FROM steam_openid_states WHERE state=?").get(state) as {user_id:string;expires_at:number;return_base:string}|undefined;
   db.prepare("DELETE FROM steam_openid_states WHERE state=?").run(state);
-  if(!saved||saved.user_id!==req.userId||saved.expires_at<Date.now())return res.status(400).send("Conexão Steam expirada. Volte ao PugotiList e tente novamente.");
+  if(!saved||saved.user_id!==req.userId||saved.expires_at<Date.now())return res.status(400).send("Conexão Steam expirada. Volte ao Pugotilist e tente novamente.");
   const params=new URLSearchParams();for(const [key,value] of Object.entries(req.query))if(key.startsWith("openid.")&&typeof value==="string")params.set(key,value);params.set("openid.mode","check_authentication");
   try{const validation=await fetch("https://steamcommunity.com/openid/login",{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:params});const result=await validation.text();if(!result.includes("is_valid:true"))throw new Error("invalid");const claimed=String(req.query["openid.claimed_id"]||"");const match=claimed.match(/^https:\/\/steamcommunity\.com\/openid\/id\/(\d{17})$/);if(!match)throw new Error("identity");db.prepare(`INSERT INTO user_steam_connections(user_id,steam_id_64) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET steam_id_64=excluded.steam_id_64,connected_at=CURRENT_TIMESTAMP`).run(req.userId,match[1]);res.redirect(`${saved.return_base||publicOrigin}/?steam=connected`)}catch{res.status(502).send("Não foi possível validar o login com a Steam.")}
 });
@@ -618,7 +661,7 @@ app.get("/api/integrations/xbox/connect",requireUser,(req:AuthedRequest,res)=>{
 app.get("/api/integrations/xbox/callback",requireUser,async(req:AuthedRequest,res)=>{
   const state=String(req.query.state||""),saved=db.prepare("SELECT user_id,expires_at,return_base FROM xbox_oauth_states WHERE state=?").get(state) as {user_id:string;expires_at:number;return_base:string}|undefined;
   db.prepare("DELETE FROM xbox_oauth_states WHERE state=?").run(state);
-  if(!saved||saved.user_id!==req.userId||saved.expires_at<Date.now())return res.status(400).send("Conexão Xbox expirada. Volte ao PugotiList e tente novamente.");
+  if(!saved||saved.user_id!==req.userId||saved.expires_at<Date.now())return res.status(400).send("Conexão Xbox expirada. Volte ao Pugotilist e tente novamente.");
   try{
     const code=String(req.query.code||"");if(!code)throw new Error("Código ausente.");
     const token=await xboxMicrosoftToken(new URLSearchParams({client_id:xboxClientId,client_secret:xboxClientSecret,code,redirect_uri:xboxRedirectUri,grant_type:"authorization_code"}));
@@ -634,17 +677,6 @@ app.get("/api/integrations/xbox/profile",requireUser,async(req:AuthedRequest,res
   const connection=db.prepare("SELECT * FROM user_xbox_connections WHERE user_id=?").get(req.userId) as {xuid:string;gamertag:string;refresh_token:string}|undefined;
   if(!connection)return res.status(404).json({error:"Nenhuma conta Xbox conectada."});
   try{const token=await xboxMicrosoftToken(new URLSearchParams({client_id:xboxClientId,client_secret:xboxClientSecret,refresh_token:decryptXboxToken(connection.refresh_token),grant_type:"refresh_token",scope:"xboxlive.signin xboxlive.offline_access"}));const session=await xboxSessionFromAccessToken(token.access_token),profile=await xboxProfile(session);if(token.refresh_token)db.prepare("UPDATE user_xbox_connections SET refresh_token=?,xuid=?,gamertag=?,last_synced_at=CURRENT_TIMESTAMP WHERE user_id=?").run(encryptXboxToken(token.refresh_token),profile.xuid,profile.gamertag,req.userId);res.json({connected:true,...profile})}catch{res.status(502).json({error:"Não foi possível atualizar o perfil Xbox."})}
-});
-app.get("/api/games/:id/xbox-achievements",requireUser,async(req:AuthedRequest,res)=>{
-  if(!xboxClientId||!xboxClientSecret||!xboxTokenEncryptionKey)return res.status(503).json({error:"A integração Xbox ainda não foi configurada no servidor."});
-  const item=db.prepare("SELECT xbox_title_id,title FROM library_items WHERE id=? AND user_id=? AND media_type='game'").get(req.params.id,req.userId) as {xbox_title_id:string;title:string}|undefined;
-  if(!item?.xbox_title_id)return res.status(404).json({error:"Este jogo ainda não foi associado à versão Xbox."});
-  try{
-    const session=await xboxSessionForUser(req.userId!),url=new URL(`https://achievements.xboxlive.com/users/xuid(${encodeURIComponent(session.xuid)})/achievements`);
-    url.searchParams.set("titleId",item.xbox_title_id);url.searchParams.set("maxItems","500");url.searchParams.set("orderBy","Title");
-    const response=await fetch(url,{headers:{authorization:session.authorization,"x-xbl-contract-version":"2","accept-language":"pt-BR,pt;q=0.9"},signal:AbortSignal.timeout(15000)});const body=await response.json().catch(()=>({}));if(!response.ok)throw new Error("Xbox indisponível.");
-    const achievements=(body.achievements||[]).map((achievement:any)=>{const progress=achievement.progression?.requirements?.[0]?.current||0,total=achievement.progression?.requirements?.[0]?.target||0;const unlocked=achievement.progressState==="Achieved"||achievement.progressState==="Unlocked";const assets=achievement.mediaAssets||[];const assetUrl=(names:string[])=>assets.find((asset:any)=>names.includes(String(asset.name||"").toLowerCase()))?.url||assets[0]?.url||"";return{id:String(achievement.id||achievement.name),name:achievement.name||"Conquista",description:achievement.description||"",iconUrl:assetUrl(["xbox-achievement-unlocked","achievement_unlocked"]),lockedIconUrl:assetUrl(["xbox-achievement-locked","achievement_locked"]),unlocked,progress:total?`${progress}/${total}`:"",unlockedAt:achievement.unlockedDate||null,gamerscore:Number(achievement.rewards?.[0]?.value||0)}});const unlocked=achievements.filter((achievement:any)=>achievement.unlocked).length;db.prepare("UPDATE library_items SET xbox_achievement_total=?,xbox_achievement_unlocked=?,xbox_achievements_synced_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?").run(achievements.length,unlocked,req.params.id,req.userId);res.json({xboxTitleId:item.xbox_title_id,connected:true,gameName:item.title,total:achievements.length,unlocked,completionPercent:achievements.length?Math.round(unlocked/achievements.length*100):0,achievements});
-  }catch(error){res.status(502).json({error:error instanceof Error?error.message:"O Xbox não respondeu com as conquistas."})}
 });
 app.get("/api/games/:id/achievements",requireUser,async(req:AuthedRequest,res)=>{
   if(!steamApiKey)return res.status(503).json({error:"A chave da Steam ainda não foi configurada no servidor."});
@@ -697,6 +729,7 @@ app.get("/api/games/:id/guides",requireUser,async(req:AuthedRequest,res)=>{
     res.json(data);
   }catch{res.status(502).json({error:"A Steam não respondeu com os guias deste jogo."});}
 });
+app.get("/", (_req, res) => { res.setHeader("Cache-Control", "no-cache"); res.sendFile(path.join(publicDir, "index.html")); });
 app.use(express.static(publicDir, { extensions: ["html"], maxAge: process.env.NODE_ENV === "production" ? "1h" : 0 }));
 app.use((_req, res) => res.sendFile(path.join(publicDir, "index.html")));
-app.listen(port, () => console.log(`PugotiList ativo na porta ${port}`));
+app.listen(port, () => console.log(`Pugotilist ativo na porta ${port}`));
